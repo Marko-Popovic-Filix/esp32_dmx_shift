@@ -24,8 +24,12 @@
 #define STROBE_DUTY         0.50f
 
 // --- SOS (Morse) params ---
-// Unit length; dot=1u, dash=3u; gaps: in-symbol=1u, between letters=3u, between words=7u
 #define SOS_UNIT_MS         120
+
+// --- Flash-3 (broadcast) params ---
+#define FLASH3_ON_MS        180.0f   // on-time per flash
+#define FLASH3_OFF_MS       180.0f   // off-time per flash
+#define FLASH3_COUNT        3        // exactly 3 flashes
 
 static const char *TAG = "dmx_ctrl";
 
@@ -54,6 +58,16 @@ static group_state_t g_faro1 = { .base = 1,  .mode = MODE_OFF };
 static group_state_t g_faro2 = { .base = 5,  .mode = MODE_OFF };
 static group_state_t g_rdd1  = { .base = 9,  .mode = MODE_OFF };
 static group_state_t g_rdd2  = { .base = 13, .mode = MODE_OFF };
+
+/* ---- Global “flash 3x” override (broadcast) ---- */
+typedef struct {
+    bool        active;
+    TickType_t  t0;          // start tick
+    uint8_t     rgba[4];     // levels to flash with
+    uint8_t     mask[4];     // which channels flash
+} flash3_t;
+
+static flash3_t s_flash3 = {0};
 
 /* ---- DMX send helpers ---- */
 static inline void dmx_send_frame(void) {
@@ -87,16 +101,7 @@ static inline uint8_t strobe_wave(float t_ms, float hz, float duty, uint8_t amp)
     return (phase < duty) ? amp : 0;
 }
 
-/* SOS pattern in plain C:
-   “… --- …” expanded to on/off segments in units (u), then scaled by SOS_UNIT_MS.
-   We explicitly encode the sequence (on_u, off_u):
-
-   S: dot(1u on,1u off), dot(1,1), dot(1,3 letter gap)
-   O: dash(3,1), dash(3,1), dash(3,3 letter gap)
-   S: dot(1,1), dot(1,1), dot(1,7 word gap)
-
-   Total units = 34u
-*/
+/* SOS pattern in plain C (… --- …) */
 static bool sos_on_at(float t_ms) {
     typedef struct { uint8_t on_u; uint8_t off_u; } seg_t;
     static const seg_t segs[] = {
@@ -109,7 +114,6 @@ static bool sos_on_at(float t_ms) {
     };
     static const int seg_count = (int)(sizeof(segs)/sizeof(segs[0]));
 
-    // Compute total period in ms
     int total_u = 0;
     for (int i=0;i<seg_count;i++) total_u += segs[i].on_u + segs[i].off_u;
     if (total_u <= 0) total_u = 1;
@@ -124,19 +128,20 @@ static bool sos_on_at(float t_ms) {
         float off_ms = (float)segs[i].off_u * unit_ms;
 
         if (on_ms > 0.0f) {
-            if (tm >= acc && tm < acc + on_ms) return true;  // inside ON segment
+            if (tm >= acc && tm < acc + on_ms) return true;
             acc += on_ms;
         }
         if (off_ms > 0.0f) {
-            if (tm >= acc && tm < acc + off_ms) return false; // inside OFF segment
+            if (tm >= acc && tm < acc + off_ms) return false;
             acc += off_ms;
         }
     }
-    return false; // guard
+    return false;
 }
 
+/* Render helpers */
 static void render_group(group_state_t *g, float t_ms){
-    // Clear this group's slots first (so OFF really turns off)
+    // Clear this group's slots first
     for (int i = 0; i < 4; i++){
         int ch = g->base + i;
         if (ch >= 1 && ch <= DMX_UNIVERSE_SIZE) dmx_buffer[ch] = 0;
@@ -188,6 +193,31 @@ static void render_group(group_state_t *g, float t_ms){
     }
 }
 
+static void render_flash3_all(float t_ms){
+    float period = FLASH3_ON_MS + FLASH3_OFF_MS;
+    float elapsed = (float)((xTaskGetTickCount() - s_flash3.t0) * portTICK_PERIOD_MS);
+
+    // Stop after 3 complete flashes
+    if (elapsed >= (float)FLASH3_COUNT * period) {
+        s_flash3.active = false;
+        return;
+    }
+
+    float phase = fmodf(elapsed, period);
+    bool on = (phase < FLASH3_ON_MS);
+
+    // Apply to all 4 fixtures
+    group_state_t* gs[] = { &g_faro1, &g_faro2, &g_rdd1, &g_rdd2 };
+    for (int g = 0; g < 4; g++) {
+        for (int i = 0; i < 4; i++){
+            int ch = gs[g]->base + i;
+            if (ch >= 1 && ch <= DMX_UNIVERSE_SIZE){
+                dmx_buffer[ch] = (on && s_flash3.mask[i]) ? s_flash3.rgba[i] : 0;
+            }
+        }
+    }
+}
+
 static void dmx_task(void *arg) {
     ESP_LOGI(TAG, "DMX task started on core %d", xPortGetCoreID());
     TickType_t t0 = xTaskGetTickCount();
@@ -198,10 +228,15 @@ static void dmx_task(void *arg) {
 
         dmx_buffer[0] = 0x00; // start code
 
-        render_group(&g_faro1, t_ms);
-        render_group(&g_faro2, t_ms);
-        render_group(&g_rdd1,  t_ms);
-        render_group(&g_rdd2,  t_ms);
+        if (s_flash3.active) {
+            // Broadcast flash overrides everything while active
+            render_flash3_all(t_ms);
+        } else {
+            render_group(&g_faro1, t_ms);
+            render_group(&g_faro2, t_ms);
+            render_group(&g_rdd1,  t_ms);
+            render_group(&g_rdd2,  t_ms);
+        }
 
         dmx_send_frame();
         vTaskDelay(dt);
@@ -330,7 +365,6 @@ static void apply_command_to_group(group_state_t *g, const char *c, int R,int G,
     else if (strcasecmp(c, "strobe b")    == 0)     set_strobe(g,  R,G,B,W, 0,0,1,0);
     else if (strcasecmp(c, "strobe w")    == 0)     set_strobe(g,  R,G,B,W, 0,0,0,1);
 
-    // SOS: plain "sos" defaults to white channel only
     else if (strcasecmp(c, "sos")         == 0)     set_sos(g,     R,G,B,W, 0,0,0,1);
     else if (strcasecmp(c, "sos all")     == 0)     set_sos(g,     R,G,B,W, 1,1,1,1);
     else if (strcasecmp(c, "sos r")       == 0)     set_sos(g,     R,G,B,W, 1,0,0,0);
@@ -339,6 +373,14 @@ static void apply_command_to_group(group_state_t *g, const char *c, int R,int G,
     else if (strcasecmp(c, "sos w")       == 0)     set_sos(g,     R,G,B,W, 0,0,0,1);
 
     else                                            set_static(g, R,G,B,W);
+}
+
+/* Trigger 3x broadcast flash */
+static void flash3_start_rgbw(uint8_t R,uint8_t G,uint8_t B,uint8_t W, uint8_t mR,uint8_t mG,uint8_t mB,uint8_t mW){
+    s_flash3.active = true;
+    s_flash3.t0     = xTaskGetTickCount();
+    s_flash3.rgba[0]= R; s_flash3.rgba[1]= G; s_flash3.rgba[2]= B; s_flash3.rgba[3]= W;
+    s_flash3.mask[0]= mR?1:0; s_flash3.mask[1]= mG?1:0; s_flash3.mask[2]= mB?1:0; s_flash3.mask[3]= mW?1:0;
 }
 
 esp_err_t dmx_ctrl_apply_json(const char *json, int len){
@@ -362,15 +404,24 @@ esp_err_t dmx_ctrl_apply_json(const char *json, int len){
     if (cJSON_IsString(cmd) && cmd->valuestring){
         const char *c = cmd->valuestring;
 
-        // Broadcast if "all" or missing deviceId
-        if (!dev_id || strcasecmp(dev_id, "all") == 0) {
-            apply_command_to_group(&g_faro1, c, R,G,B,W);
-            apply_command_to_group(&g_faro2, c, R,G,B,W);
-            apply_command_to_group(&g_rdd1,  c, R,G,B,W);
-            apply_command_to_group(&g_rdd2,  c, R,G,B,W);
+        // NEW: boolean-style broadcast flashes
+        if (strcasecmp(c, "true") == 0) {
+            // flash GREEN 3x on all devices
+            flash3_start_rgbw(0, 255, 0, 0, 0,1,0,0);
+        } else if (strcasecmp(c, "false") == 0) {
+            // flash RED 3x on all devices
+            flash3_start_rgbw(255, 0, 0, 0, 1,0,0,0);
         } else {
-            group_state_t *g = pick_group(dev_id);
-            if (g) apply_command_to_group(g, c, R,G,B,W);
+            // normal device/broadcast control
+            if (!dev_id || strcasecmp(dev_id, "all") == 0) {
+                apply_command_to_group(&g_faro1, c, R,G,B,W);
+                apply_command_to_group(&g_faro2, c, R,G,B,W);
+                apply_command_to_group(&g_rdd1,  c, R,G,B,W);
+                apply_command_to_group(&g_rdd2,  c, R,G,B,W);
+            } else {
+                group_state_t *g = pick_group(dev_id);
+                if (g) apply_command_to_group(g, c, R,G,B,W);
+            }
         }
     } else {
         // No command: treat as static set
