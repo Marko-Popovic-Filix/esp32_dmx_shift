@@ -1,0 +1,40 @@
+menu "App Settings"
+    config APP_AP_SSID_PREFIX
+        string "Setup AP SSID prefix"
+        default "ESP-SETUP-"
+
+    config APP_AP_PASSWORD
+        string "Setup AP password (>=8 chars; empty=open)"
+        default "12345678"
+
+    config APP_BUTTON_GPIO
+        int "Setup/reset button GPIO"
+        default 0
+
+    config APP_BUTTON_LONG_MS
+        int "Long-press duration to erase creds (ms)"
+        default 3000
+        range 500 10000
+endmenu
+menu "Network Posting (API Gateway / S3)"
+
+config POST_URL
+    string "POST endpoint URL"
+    default "https://your-api-id.execute-api.your-region.amazonaws.com/prod/ingest"
+    help
+        Full HTTPS endpoint of API Gateway that invokes your Lambda → S3.
+
+config POST_API_KEY
+    string "POST API key (x-api-key header)"
+    default ""
+    help
+        If your API Gateway uses an API key, put it here. Leave empty if not used.
+
+config POST_PERIOD_SEC
+    int "POST period (seconds)"
+    default 300
+    range 30 3600
+    help
+        How often to post sensor readings (seconds). Default 300 = 5 minutes.
+
+endmenu

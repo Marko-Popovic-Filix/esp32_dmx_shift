@@ -1,0 +1,29 @@
+menu "Application Configuration"
+
+config APP_POST_URL
+    string "S3 JSON URL (HTTPS)"
+    default "https://example-bucket.s3.amazonaws.com/latest-command.json"
+    help
+        Full HTTPS URL to the S3 object containing the latest command JSON.
+        Use a public object or a pre-signed URL for private buckets.
+
+config APP_DEVICE_ID
+    string "Device ID (unused by net_post; kept for compatibility)"
+    default "device-01"
+    help
+        Retained for compatibility; ignored by S3 polling.
+
+config APP_API_KEY
+    string "API key (unused for S3; kept for compatibility)"
+    default ""
+    help
+        Retained for compatibility; ignored by S3 polling.
+
+config APP_POST_INTERVAL_SEC
+    int "Polling interval (seconds)"
+    range 1 86400
+    default 3
+    help
+        How often to GET the S3 JSON. Minimum 1 second.
+
+endmenu
